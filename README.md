@@ -1,6 +1,6 @@
  # Launch server
   - python3 -m venv myenv
-  - source ./myenv/bin/active
+  - source ./myenv/bin/activate
   - pip install flask 
   - python3 server.py
 
@@ -11,7 +11,8 @@
 
 # Test in a project
 ## Create a local project
-  - mk demo
+  - mkdir demo
+  - cd demo
   - echo "this is a test" > test.txt
   - git init
   - git add .
