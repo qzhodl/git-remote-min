@@ -1,19 +1,11 @@
 #!/usr/bin/env node
-/**
- * Minimal Git remote helper (min://) — robust push (self-pack) version.
- * Node ≥ 18 (uses global fetch).
- *
- * Push strategy:
- *   - Ignore stdin payload from Git.
- *   - Always self-generate a full pack via `git pack-objects --stdout --all`.
- *   - Upload that pack and call updateRefs with oldOid="".
- */
+// git-remote-min — delta prototype (raw-thin only, no server-side validation)
+// Node >= 18
 
 import { createInterface } from "node:readline";
 import { stdin, stdout, stderr } from "node:process";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const GIT_DIR = process.env.GIT_DIR || ".git";
@@ -29,46 +21,32 @@ if (!REMOTE_URL) {
 }
 function parseUrl(u) {
     if (!u.startsWith("min://")) throw new Error("Only min:// supported");
-    const url = new URL(u.replace("min://", "http://")); // transport via HTTP
+    const url = new URL(u.replace("min://", "http://"));
     return { base: `${url.protocol}//${url.host}`, repo: url.pathname.replace(/^\/+/, "") };
 }
 const { base, repo } = parseUrl(REMOTE_URL);
 log("MIN base:", base, "repo:", repo);
 
 // ---- HTTP helper ----
-async function http(method, path, {
-    body = null,
-    responseType = "json",
-    contentType = undefined
-} = {}) {
+async function http(method, path, { body = null, responseType = "json", contentType } = {}) {
     const headers = {};
     if (body != null) {
-        if (contentType) {
-            headers["Content-Type"] = contentType;
-        } else if (body instanceof Uint8Array || Buffer.isBuffer(body)) {
-            headers["Content-Type"] = "application/octet-stream";
-        } else {
-            headers["Content-Type"] = "application/json";
-            if (typeof body !== "string") body = JSON.stringify(body);
-        }
+        if (contentType) headers["Content-Type"] = contentType;
+        else if (body instanceof Uint8Array || Buffer.isBuffer(body)) headers["Content-Type"] = "application/octet-stream";
+        else { headers["Content-Type"] = "application/json"; if (typeof body !== "string") body = JSON.stringify(body); }
     }
-
     const res = await fetch(base + path, { method, body, headers });
-
-    const buf = await res.arrayBuffer();                  // 先读原始字节
-    const text = new TextDecoder().decode(buf);           // 方便出错时打印
+    const buf = await res.arrayBuffer();
+    const text = new TextDecoder().decode(buf);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${method} ${path} ${text}`);
-
     if (responseType === "binary") return new Uint8Array(buf);
     if (responseType === "text") return text;
-
-    // 默认 json
-    try { return JSON.parse(text); }
-    catch { throw new Error(`Non-JSON response: ${text}`); }
+    try { return JSON.parse(text); } catch { throw new Error(`Non-JSON: ${text}`); }
 }
+
 // ---- protocol state ----
-let refToPackId = new Map();
-let pendingPushes = [];
+let refTips = new Map();     // name -> oid
+let pendingPushes = [];      // {src,dst}
 let readingPushBatch = false;
 
 // ---- main loop ----
@@ -78,12 +56,12 @@ rl.on("line", async (line) => {
         if (readingPushBatch) {
             readingPushBatch = false;
             try {
-                await handlePushSelfPack();
+                await handlePushDelta();
                 for (const { dst } of pendingPushes) out(`ok ${dst}`);
-                out(""); // end push status report
+                out("");
             } catch (e) {
                 stderr.write(`[push] failed: ${e.message}\n`);
-                for (const { dst } of pendingPushes) out(`error ${dst} "${e.message.replace(/"/g, '\\"')}"`);
+                for (const { dst } of pendingPushes) out(`error ${dst} "${String(e.message).replace(/"/g, '\\"')}"`);
                 out("");
             } finally {
                 pendingPushes = [];
@@ -124,105 +102,101 @@ rl.on("line", async (line) => {
             readingPushBatch = true;
             break;
         }
-
-        default:
-            break;
     }
 });
 
 // ---- handlers ----
 async function handleList() {
     const j = await http("GET", `/repos/${encodeURIComponent(repo)}/refs`);
-    refToPackId.clear();
+    refTips.clear();
     for (const r of (j.refs || [])) {
         out(`${r.oid} ${r.name}`);
-        if (r.packId) refToPackId.set(r.name, r.packId);
+        refTips.set(r.name, r.oid);
     }
     out("");
 }
 
 async function handleFetch(refname) {
-    const packId = refToPackId.get(refname);
-    if (!packId) { out(""); return; }
+    // 1) 计算 base：优先用本地 remote-tracking
+    const short = refname.startsWith("refs/heads/") ? refname.slice("refs/heads/".length) : refname;
+    let baseOid = "";
+    try { baseOid = (await runGitCapture(["rev-parse", `refs/remotes/origin/${short}`])).trim(); } catch { }
 
-    const buf = await http("GET",
-        `/repos/${encodeURIComponent(repo)}/packs/${encodeURIComponent(packId)}`,
-        { responseType: "binary" }
-    );
+    // 2) 请求 delta 列表
+    const q = new URLSearchParams({ ref: refname, base: baseOid }).toString();
+    const j = await http("GET", `/repos/${encodeURIComponent(repo)}/delta?${q}`);
+    if (!j.ok) {
+        if (j.reason === "BaseNotFound") throw new Error(`BaseNotFound for ${refname}`);
+        throw new Error(`delta error: ${JSON.stringify(j)}`);
+    }
+    const packs = j.packs || [];
+    if (packs.length === 0) { out(""); return; }
 
-    const packDir = join(GIT_DIR, "objects", "pack");       // <<< use GIT_DIR
+    // 3) 逐个下载 raw-thin 并导入（本地用 index-pack 修薄为全）
+    for (const name of packs) {
+        const buf = await http("GET", `/repos/${encodeURIComponent(repo)}/packs/${encodeURIComponent(name)}`, { responseType: "binary" });
+        await runGitIndexPackFromBuf(buf);
+    }
+
+    // 4) keep 锁防止 GC
+    const packDir = join(GIT_DIR, "objects", "pack");
     if (!existsSync(packDir)) mkdirSync(packDir, { recursive: true });
-    const tmpPack = join(packDir, `min-fetch-${Date.now()}.pack`);
-    writeFileSync(tmpPack, buf);
-
-    await runGit(["index-pack", "--keep", "-v", tmpPack]);  // <<< use -v
-
     const keepPath = join(packDir, `min-helper-${Date.now()}.keep`);
     writeFileSync(keepPath, "keep\n");
     out(`lock ${keepPath}`);
     out("");
 }
-async function handlePushSelfPack() {
-    // 1) 用 git pack-objects 自己打包整个仓库
-    const packBuf = await runGitCaptureBuf(["pack-objects", "--stdout", "--all"]);
 
-    // 2) 上传 pack
-    const up = await http("POST", `/repos/${encodeURIComponent(repo)}/packs`, {
-        body: packBuf,
-        responseType: "json",                         // 解析成 JSON
-        contentType: "application/octet-stream"       // 请求体是二进制
-    });
-
-    if (!up || !up.packId) {
-        throw new Error("upload /packs returned no packId: " + JSON.stringify(up));
-    }
-    const packId = up.packId;
-    if (process.env.DEBUG) {
-        stderr.write(`[helper] uploaded packId=${packId}\n`);
-    }
-
-    // 3) 更新 refs
-    const updates = [];
+async function handlePushDelta() {
     for (const { src, dst } of pendingPushes) {
         const newOid = (await runGitCapture(["rev-parse", src])).trim();
-        if (!newOid) throw new Error(`rev-parse failed for ${src}`);
-        updates.push({ name: dst, oldOid: "", newOid, packId });
-    }
+        const oldOid = refTips.get(dst) || "";
 
-    const res = await http("POST", `/repos/${encodeURIComponent(repo)}/updateRefs`, {
-        body: JSON.stringify({ updates })
-    });
-    if (process.env.DEBUG) {
-        stderr.write(`[helper] updateRefs response: ${JSON.stringify(res)}\n`);
+        // 1) 针对 old->new 自打 thin pack
+        let revs = `${newOid}\n`;
+        if (oldOid) revs += `^${oldOid}\n`;
+        const packBuf = await runGitCaptureBufWithStdin(
+            ["pack-objects", "--stdout", "--revs", "--thin", "--delta-base-offset"],
+            revs
+        );
+
+        // 2) 上传 raw-thin
+        const up = await http("POST", `/repos/${encodeURIComponent(repo)}/uploadRawPack`, {
+            body: packBuf, responseType: "json", contentType: "application/octet-stream"
+        });
+        const rawPack = up.rawPack;
+
+        // 3) 原子前移 refs
+        const body = { updates: [{ name: dst, oldOid, newOid, rawPack }] };
+        await http("POST", `/repos/${encodeURIComponent(repo)}/updateRefs`, { body });
     }
 }
 
 // ---- small git helpers ----
-function runGit(args) {
-    return new Promise((resolve, reject) => {
-        const child = spawn("git", args, { stdio: ["ignore", "ignore", "inherit"] });
-        child.on("error", reject);
-        child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`git ${args.join(" ")} exited ${code}`)));
-    });
-}
 function runGitCapture(args) {
     return new Promise((resolve, reject) => {
         const child = spawn("git", args, { stdio: ["ignore", "pipe", "inherit"] });
         let buf = "";
-        child.stdout.on("data", (d) => (buf += d.toString()));
+        child.stdout.on("data", d => buf += d.toString());
         child.on("error", reject);
-        child.on("close", (code) => code === 0 ? resolve(buf) : reject(new Error(`git ${args.join(" ")} exited ${code}`)));
+        child.on("close", code => code === 0 ? resolve(buf) : reject(new Error(`git ${args.join(" ")} exited ${code}`)));
     });
 }
-function runGitCaptureBuf(args) {
+function runGitCaptureBufWithStdin(args, stdinStr) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        const child = spawn("git", args, { stdio: ["ignore", "pipe", "inherit"] });
-        child.stdout.on("data", (d) => chunks.push(d));
+        const child = spawn("git", args, { stdio: ["pipe", "pipe", "inherit"] });
+        child.stdout.on("data", d => chunks.push(d));
         child.on("error", reject);
-        child.on("close", (code) => {
-            if (code === 0) resolve(Buffer.concat(chunks));
-            else reject(new Error(`git ${args.join(" ")} exited ${code}`));
-        });
+        child.on("close", code => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`git ${args.join(" ")} exited ${code}`)));
+        child.stdin.end(Buffer.from(stdinStr, "utf-8"));
+    });
+}
+function runGitIndexPackFromBuf(buf) {
+    return new Promise((resolve, reject) => {
+        const child = spawn("git", ["index-pack", "--stdin", "--fix-thin", "--keep", "-v"], { stdio: ["pipe", "ignore", "inherit"] });
+        child.on("error", reject);
+        child.on("close", code => code === 0 ? resolve() : reject(new Error(`git index-pack --stdin exited ${code}`)));
+        child.stdin.end(buf);
     });
 }
