@@ -9,7 +9,7 @@ def repo_dir(repo):
     d = os.path.join(BASE, repo)
     pk = os.path.join(d, "objects", "pack")
     os.makedirs(pk, exist_ok=True)
-    # 初始化元数据
+    # init refs.json and updates.json if not exist
     refs_p = os.path.join(d, "refs.json")
     upds_p = os.path.join(d, "updates.json")
     if not os.path.exists(refs_p):
@@ -28,8 +28,8 @@ def list_refs(repo):
 @app.post("/repos/<repo>/uploadRawPack")
 def upload_raw_pack(repo):
     """
-    接收客户端上传的原始 thin pack，不做校验，直接保存为 raw-<sha256>.pack。
-    返回 rawPack 文件名、sha256 与 size。
+    receive a raw thin pack uploaded by client, save it as raw-<sha256>.pack without validation.
+    return rawPack filename, sha256 and size.
     """
     d = repo_dir(repo)
     data = request.get_data(cache=False)
@@ -44,9 +44,9 @@ def upload_raw_pack(repo):
 @app.post("/repos/<repo>/updateRefs")
 def update_refs(repo):
     """
-    前移 refs，并把这次 push 追加到 updates.json。
-    记录 rawPack（raw-*.pack）。执行 FF 检查；你需要 force 可自行扩展。
-    """
+    Move refs forward and append this push to updates.json.
+    Save rawPack (raw-*.pack)
+    """    
     d = repo_dir(repo)
     refs_path = os.path.join(d, "refs.json")
     upds_path = os.path.join(d, "updates.json")
@@ -66,12 +66,12 @@ def update_refs(repo):
         if not os.path.exists(raw_file):
             return jsonify({"ok": False, "error": f"rawPack not found: {rawp}"}), 400
 
-    # 写回 refs
+    # Write back refs
     for u in updates:
         meta["refs"][u["name"]] = {"oid": u["newOid"]}
     with open(refs_path, "w") as f: json.dump(meta, f)
 
-    # 记录增量链
+    # Record delta chain
     log = json.load(open(upds_path))
     for u in updates:
         log.append({
@@ -88,10 +88,10 @@ def update_refs(repo):
 @app.get("/repos/<repo>/delta")
 def delta_chain(repo):
     """
-    返回 base→tip 的 raw-thin 列表：
-      - base == tip         → 空列表
-      - base 为空（新 clone）→ 全链
-      - base 不在链上       → BaseNotFound（本原型不返回快照）
+    Return the raw-thin list for base→tip:
+      - base == tip         → empty list
+      - base is empty (new clone) → full chain
+      - base is not on chain       → BaseNotFound (this prototype does not return snapshots)
     """
     d = repo_dir(repo)
     ref = request.args.get("ref")
@@ -127,7 +127,7 @@ def delta_chain(repo):
 
 @app.get("/repos/<repo>/packs/<packname>")
 def get_pack(repo, packname):
-    # 仅允许下载 raw-*.pack
+    # only allow downloading raw-*.pack
     d = repo_dir(repo)
     if not (packname.startswith("raw-") and packname.endswith(".pack")):
         return ("forbidden", 403)

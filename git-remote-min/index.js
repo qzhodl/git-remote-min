@@ -117,12 +117,12 @@ async function handleList() {
 }
 
 async function handleFetch(refname) {
-    // 1) 计算 base：优先用本地 remote-tracking
+    // 1) compute base: prefer local remote-tracking
     const short = refname.startsWith("refs/heads/") ? refname.slice("refs/heads/".length) : refname;
     let baseOid = "";
     try { baseOid = (await runGitCapture(["rev-parse", `refs/remotes/origin/${short}`])).trim(); } catch { }
 
-    // 2) 请求 delta 列表
+    // 2) request delta list
     const q = new URLSearchParams({ ref: refname, base: baseOid }).toString();
     const j = await http("GET", `/repos/${encodeURIComponent(repo)}/delta?${q}`);
     if (!j.ok) {
@@ -132,13 +132,13 @@ async function handleFetch(refname) {
     const packs = j.packs || [];
     if (packs.length === 0) { out(""); return; }
 
-    // 3) 逐个下载 raw-thin 并导入（本地用 index-pack 修薄为全）
+    // 3) download raw-thin packs and import (fix thin to full with index-pack)
     for (const name of packs) {
         const buf = await http("GET", `/repos/${encodeURIComponent(repo)}/packs/${encodeURIComponent(name)}`, { responseType: "binary" });
         await runGitIndexPackFromBuf(buf);
     }
 
-    // 4) keep 锁防止 GC
+    // 4) keep lock to prevent GC
     const packDir = join(GIT_DIR, "objects", "pack");
     if (!existsSync(packDir)) mkdirSync(packDir, { recursive: true });
     const keepPath = join(packDir, `min-helper-${Date.now()}.keep`);
@@ -152,7 +152,7 @@ async function handlePushDelta() {
         const newOid = (await runGitCapture(["rev-parse", src])).trim();
         const oldOid = refTips.get(dst) || "";
 
-        // 1) 针对 old->new 自打 thin pack
+        // 1) create raw-thin pack for old->new
         let revs = `${newOid}\n`;
         if (oldOid) revs += `^${oldOid}\n`;
         const packBuf = await runGitCaptureBufWithStdin(
@@ -160,13 +160,13 @@ async function handlePushDelta() {
             revs
         );
 
-        // 2) 上传 raw-thin
+        // 2) upload raw-thin
         const up = await http("POST", `/repos/${encodeURIComponent(repo)}/uploadRawPack`, {
             body: packBuf, responseType: "json", contentType: "application/octet-stream"
         });
         const rawPack = up.rawPack;
 
-        // 3) 原子前移 refs
+        // 3) atomically move refs forward
         const body = { updates: [{ name: dst, oldOid, newOid, rawPack }] };
         await http("POST", `/repos/${encodeURIComponent(repo)}/updateRefs`, { body });
     }
