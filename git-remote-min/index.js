@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// git-remote-min — delta prototype (raw-thin only, no server-side validation)
+// git-remote-min — delta prototype (fixed HEAD symref + clone-safe base)
 // Node >= 18
 
 import { createInterface } from "node:readline";
@@ -48,6 +48,7 @@ async function http(method, path, { body = null, responseType = "json", contentT
 let refTips = new Map();     // name -> oid
 let pendingPushes = [];      // {src,dst}
 let readingPushBatch = false;
+let isCloning = false;       // set by "option cloning true"
 
 // ---- main loop ----
 const rl = createInterface({ input: stdin, crlfDelay: Infinity });
@@ -82,16 +83,22 @@ rl.on("line", async (line) => {
             out("");
             break;
 
-        case "option":
+        case "option": {
+            // Git may send: "option progress true", "option verbosity 1", "option cloning true"
+            if (parts[1] === "cloning" && parts[2] === "true") {
+                isCloning = true;
+                log("[state] cloning mode enabled");
+            }
             out("ok");
             break;
+        }
 
         case "list":
             await handleList();
             break;
 
         case "fetch": {
-            const refname = parts.slice(2).join(" ");
+            const refname = parts.slice(2).join(" "); // format: "fetch <want-oid> <refname>"
             await handleFetch(refname);
             break;
         }
@@ -109,20 +116,25 @@ rl.on("line", async (line) => {
 async function handleList() {
     const j = await http("GET", `/repos/${encodeURIComponent(repo)}/refs`);
     refTips.clear();
+
     for (const r of (j.refs || [])) {
-        out(`${r.oid} ${r.name}`);
+        if (!r || !r.name || !r.oid) continue;
+        if (r.name.toUpperCase() === "HEAD") continue;       // don't advertise HEAD as a plain ref
+        out(`${r.oid} ${r.name}`);                          // use tab as separator
         refTips.set(r.name, r.oid);
     }
-    out("");
+    out(""); // end of list block
 }
 
 async function handleFetch(refname) {
-    // 1) compute base: prefer local remote-tracking
-    const short = refname.startsWith("refs/heads/") ? refname.slice("refs/heads/".length) : refname;
+    // 1) compute base OID (skip during clone)
     let baseOid = "";
-    try { baseOid = (await runGitCapture(["rev-parse", `refs/remotes/origin/${short}`])).trim(); } catch { }
+    if (!isCloning) {
+        const short = refname.startsWith("refs/heads/") ? refname.slice("refs/heads/".length) : refname;
+        try { baseOid = (await runGitCapture(["rev-parse", `refs/remotes/origin/${short}`])).trim(); } catch { }
+    }
 
-    // 2) request delta list
+    // 2) ask server for delta chain
     const q = new URLSearchParams({ ref: refname, base: baseOid }).toString();
     const j = await http("GET", `/repos/${encodeURIComponent(repo)}/delta?${q}`);
     if (!j.ok) {
@@ -132,13 +144,13 @@ async function handleFetch(refname) {
     const packs = j.packs || [];
     if (packs.length === 0) { out(""); return; }
 
-    // 3) download raw-thin packs and import (fix thin to full with index-pack)
+    // 3) download raw-thin packs and import (fix thin to full)
     for (const name of packs) {
         const buf = await http("GET", `/repos/${encodeURIComponent(repo)}/packs/${encodeURIComponent(name)}`, { responseType: "binary" });
         await runGitIndexPackFromBuf(buf);
     }
 
-    // 4) keep lock to prevent GC
+    // 4) emit a .keep lock to prevent GC
     const packDir = join(GIT_DIR, "objects", "pack");
     if (!existsSync(packDir)) mkdirSync(packDir, { recursive: true });
     const keepPath = join(packDir, `min-helper-${Date.now()}.keep`);
@@ -152,7 +164,7 @@ async function handlePushDelta() {
         const newOid = (await runGitCapture(["rev-parse", src])).trim();
         const oldOid = refTips.get(dst) || "";
 
-        // 1) create raw-thin pack for old->new
+        // 1) make a raw-thin pack for old->new
         let revs = `${newOid}\n`;
         if (oldOid) revs += `^${oldOid}\n`;
         const packBuf = await runGitCaptureBufWithStdin(
